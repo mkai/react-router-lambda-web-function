@@ -15,7 +15,7 @@ only what it takes to run a website as a Web Function behind CloudFront.
 Browser ──HTTPS──▶ CloudFront ──SigV4 (OAC)──▶ Web Function endpoint (IamAuth) ──▶ Node HTTP server
                     │                                                               (node:http + React Router)
                     ├─ /assets/*  → CachingOptimized (immutable, served by the function)
-                    └─ /*         → dynamic cache policy (TTL 0, compression), AllViewerExceptHostHeader
+                    └─ /*         → dynamic cache policy (TTL 0), AllViewerExceptHostHeader
 ```
 
 | Resource                                 | Purpose                                                                       |
@@ -25,7 +25,7 @@ Browser ──HTTPS──▶ CloudFront ──SigV4 (OAC)──▶ Web Function 
 | `AWS::Lambda::WebFunctionEndpoint`       | HTTPS endpoint, `AuthType: IamAuth`, 100% of traffic to the new revision      |
 | `AWS::Lambda::ResourcePolicy`            | Only `cloudfront.amazonaws.com` with `aws:SourceArn` = this distribution      |
 | `AWS::CloudFront::OriginAccessControl`   | Type `lambda`, signing behavior `always-amz-auth`, `sigv4`                    |
-| `AWS::CloudFront::CachePolicy`           | No caching for HTML, but gzip/Brotli compression                              |
+| `AWS::CloudFront::CachePolicy`           | No caching for HTML; forwards the normalized `Accept-Encoding`                |
 | `AWS::CloudFront::ResponseHeadersPolicy` | Removes `lambda-web-request-id` and `lambda-web-logstream`                    |
 | `AWS::CloudFront::Distribution`          | Default certificate, no alias                                                 |
 
@@ -36,10 +36,22 @@ CloudFormation creates the new one first, switches the endpoint to it, and then 
 
 **No.** A Web Function doesn't receive events. Lambda runs `index.js` from the package root, and
 the app starts an ordinary HTTP server on the address in `AWS_LAMBDA_HTTP_ENDPOINT` (`host:port`).
-Here that is `node:http` with `createRequestListener` from the official `@react-router/node`
-([`server.ts`](server.ts)), without Express or any other framework. It is the same setup as on any
-other Node host. The server loads the handful of files in `build/client` into memory at startup
-and serves them from a lookup table, so paths that aren't in the build never touch the file system.
+Here that is `node:http` with `createRequestListener` from `@remix-run/node-fetch-server` and
+`createRequestHandler` from `react-router` ([`server.ts`](server.ts)), without Express or any other
+framework. `@remix-run/node-fetch-server` is the package that `@react-router/node` builds on; using
+it directly lets the server post-process React Router's fetch `Response` (see compression below).
+It is the same setup as on any other Node host. The server loads the handful of files in
+`build/client` into memory at startup and serves them from a lookup table, so paths that aren't in
+the build never touch the file system.
+
+### Compression
+
+CloudFront only compresses responses that include a `Content-Length` header. React Router streams
+SSR HTML with chunked transfer encoding, so it never has one. The server therefore compresses
+dynamic responses itself, using Brotli (quality 4) or gzip depending on the `Accept-Encoding`
+header that the cache policy forwards. It flushes after every chunk, so streaming keeps working.
+CloudFront leaves responses that already have a `Content-Encoding` alone. Static files have a
+`Content-Length` and are compressed by CloudFront.
 
 ### `@geostrategists/react-router-aws`
 
