@@ -1,0 +1,58 @@
+name: Destroy stack
+
+# Deletes the CloudFormation stack and everything in it (Web Function,
+# CloudFront distribution, IAM role, log group, policies). The artifacts
+# bucket is created outside the stack by the deploy job and is kept.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type the stack name (react-router-web-function) to confirm
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: eu-west-1
+  STACK_NAME: react-router-web-function
+
+jobs:
+  destroy:
+    name: Destroy
+    runs-on: ubuntu-latest
+    # Same group as the deploy job, so a deploy and a destroy never overlap.
+    concurrency:
+      group: cloudformation-stack
+      cancel-in-progress: false
+    # Disabling and deleting the CloudFront distribution alone takes a while.
+    timeout-minutes: 45
+    env:
+      AWS_ACCESS_KEY_ID: ${{ vars.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    steps:
+      - name: Check confirmation
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != "$STACK_NAME" ]; then
+            echo "::error::Confirmation '$CONFIRM' doesn't match the stack name '$STACK_NAME'."
+            exit 1
+          fi
+      - name: Delete stack
+        run: |
+          if ! aws cloudformation describe-stacks --stack-name "$STACK_NAME" >/dev/null 2>&1; then
+            echo "Stack $STACK_NAME doesn't exist in $AWS_REGION, nothing to delete."
+            exit 0
+          fi
+
+          aws cloudformation delete-stack --stack-name "$STACK_NAME"
+          if ! aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"; then
+            echo "::error::Deleting $STACK_NAME failed. Failed resources:"
+            aws cloudformation describe-stack-events --stack-name "$STACK_NAME" \
+              --query "StackEvents[?ResourceStatus=='DELETE_FAILED'].[LogicalResourceId,ResourceStatusReason]" \
+              --output table
+            exit 1
+          fi
+          echo "Deleted stack $STACK_NAME in $AWS_REGION." >> "$GITHUB_STEP_SUMMARY"

@@ -54,6 +54,10 @@ jobs:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
+    # Same group as the destroy workflow, so a deploy and a destroy never overlap.
+    concurrency:
+      group: cloudformation-stack
+      cancel-in-progress: false
     timeout-minutes: 30
     env:
       AWS_ACCESS_KEY_ID: ${{ vars.AWS_ACCESS_KEY_ID }}
