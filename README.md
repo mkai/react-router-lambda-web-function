@@ -53,21 +53,12 @@ header that the cache policy forwards. It flushes after every chunk, so streamin
 CloudFront leaves responses that already have a `Content-Encoding` alone. Static files have a
 `Content-Length` and are compressed by CloudFront.
 
-### `@geostrategists/react-router-aws`
-
-This adapter (v3.0.0) does **not** fit Web Functions. It only exports event handlers:
-`createAPIGatewayV1RequestHandler`, `createAPIGatewayV2RequestHandler`, `createALBRequestHandler`,
-`createFunctionURLRequestHandler` and `createFunctionURLStreamingRequestHandler`. All of them have
-the signature `(event, context)` and translate API Gateway, ALB or Function URL events into a fetch
-`Request`. A Web Function doesn't call a handler; it talks HTTP to a server listening on a port. The
-adapter exists to bridge that gap, and with Web Functions the gap is gone.
-
 ### Migrating from a Function URL setup
 
 If your app currently runs on a classic Lambda function with a Function URL behind CloudFront, the
 typical workarounds of that setup go away:
 
-- the stub for the Lambda-only `awslambda` global that the adapter needs off Lambda,
+- the stub for the Lambda-only `awslambda` global that event adapters need off Lambda,
 - rewriting the host from `x-forwarded-host` so URLs use the public domain,
 - a shared-secret header that CloudFront injects and the function checks. OAC with `IamAuth`
   replaces it.
