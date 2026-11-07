@@ -1,7 +1,10 @@
 import { readdirSync, readFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import path from 'node:path'
-import { createRequestListener } from '@react-router/node'
+import { Readable, type Duplex } from 'node:stream'
+import { constants, createBrotliCompress, createGzip } from 'node:zlib'
+import { createRequestListener } from '@remix-run/node-fetch-server'
+import { createRequestHandler } from 'react-router'
 // Resolved by Vite's typegen for type-checking and aliased to
 // ./build/server/index.js by scripts/bundle.mjs, so the React Router server
 // build ends up inside the single bundled dist/index.js.
@@ -83,7 +86,75 @@ function serveStaticFile(req: IncomingMessage, res: ServerResponse): boolean {
   return true
 }
 
-const handleRequest = createRequestListener({ build })
+// CloudFront only compresses responses that carry a Content-Length header,
+// and streamed SSR HTML never has one. So compress dynamic responses here;
+// CloudFront passes responses with a Content-Encoding through unchanged.
+// Flushing after every chunk keeps React's streaming intact.
+const COMPRESSIBLE = /^(text\/|application\/(json|javascript|xml)|image\/svg\+xml)/
+
+function createCompressor(encoding: 'br' | 'gzip'): Duplex {
+  return encoding === 'br'
+    ? createBrotliCompress({
+        flush: constants.BROTLI_OPERATION_FLUSH,
+        // Quality 4 is the usual trade-off for on-the-fly compression; the
+        // default (11) is meant for static files and costs far more CPU.
+        params: { [constants.BROTLI_PARAM_QUALITY]: 4 },
+      })
+    : createGzip({ flush: constants.Z_SYNC_FLUSH })
+}
+
+// Readable.toWeb() returns Node's own ReadableStream type, which TypeScript
+// won't accept as a DOM Response body, so bridge via the async iterator.
+function toWebStream(stream: Readable): ReadableStream<Uint8Array> {
+  const chunks: AsyncIterator<unknown> = stream[Symbol.asyncIterator]()
+  return new ReadableStream({
+    async pull(controller) {
+      const { value, done } = await chunks.next()
+      if (done) {
+        controller.close()
+      } else if (value instanceof Uint8Array) {
+        controller.enqueue(value)
+      }
+    },
+    cancel() {
+      stream.destroy()
+    },
+  })
+}
+
+function compress(request: Request, response: Response): Response {
+  const acceptEncoding = request.headers.get('accept-encoding') ?? ''
+  const encoding = /\bbr\b/.test(acceptEncoding)
+    ? 'br'
+    : /\bgzip\b/.test(acceptEncoding)
+      ? 'gzip'
+      : null
+  if (
+    !encoding ||
+    !response.body ||
+    request.method === 'HEAD' ||
+    response.headers.has('content-encoding') ||
+    !COMPRESSIBLE.test(response.headers.get('content-type') ?? '')
+  ) {
+    return response
+  }
+
+  const headers = new Headers(response.headers)
+  headers.set('content-encoding', encoding)
+  headers.append('vary', 'accept-encoding')
+  headers.delete('content-length')
+  const body = toWebStream(Readable.from(response.body).pipe(createCompressor(encoding)))
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  })
+}
+
+const handleReactRouterRequest = createRequestHandler(build)
+const handleRequest = createRequestListener(async (request) =>
+  compress(request, await handleReactRouterRequest(request)),
+)
 
 const server = createServer((req, res) => {
   if (!serveStaticFile(req, res)) {
