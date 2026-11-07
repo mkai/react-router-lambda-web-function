@@ -106,7 +106,9 @@ Der Workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) läuft so:
    hochladen.
 2. **Deploy** (nur `main`, auch manuell per `workflow_dispatch`):
    - `web.zip` nach `s3://react-router-web-function-artifacts-<account-id>/versions/<sha>/`
-     hochladen. Der Bucket wird bei Bedarf angelegt.
+     hochladen. Der Bucket wird bei Bedarf angelegt und muss versioniert sein, weil eine
+     Web-Function-Revision den Code nicht kopiert, sondern direkt aus dem Bucket liest. Pakete,
+     die eine aktive Revision noch nutzt, dürfen daher nicht gelöscht werden.
    - Stack `react-router-web-function` in **eu-west-1** deployen.
    - Smoke-Test gegen die CloudFront-URL: SSR auf arm64, Assets, POST, fremde Origin.
    - Prüfen, dass ein direkter Aufruf des Web-Function-Endpoints **403** liefert.
@@ -118,7 +120,8 @@ Die CloudFront-URL steht in der Job-Summary und in den Stack-Outputs (`Distribut
 - Repository-Variable `AWS_ACCESS_KEY_ID` und Secret `AWS_SECRET_ACCESS_KEY`, wie bei Fetchbot.
 - Der IAM-User braucht Rechte für CloudFormation, `lambda:*WebFunction*` sowie
   `lambda:PutResourcePolicy`, `GetResourcePolicy` und `DeleteResourcePolicy`, außerdem
-  `iam:CreateRole`/`PassRole`, CloudFront, CloudWatch Logs, S3 und `sts:GetCallerIdentity`.
+  `iam:CreateRole`/`PassRole`, CloudFront, CloudWatch Logs, S3 (inklusive
+  `s3:PutBucketVersioning` und `s3:GetObjectVersion`) und `sts:GetCallerIdentity`.
 
 ### Region
 

@@ -79,6 +79,10 @@ jobs:
             aws s3api create-bucket --bucket "$bucket" \
               --create-bucket-configuration LocationConstraint="$AWS_REGION"
           fi
+          # Web Function revisions read the package from this bucket instead of
+          # copying it, which requires S3 versioning.
+          aws s3api put-bucket-versioning --bucket "$bucket" \
+            --versioning-configuration Status=Enabled
           aws s3 cp web.zip "s3://$bucket/versions/$GITHUB_SHA/web.zip"
           echo "bucket=$bucket" >> "$GITHUB_OUTPUT"
       - name: Deploy CloudFormation stack
