@@ -68,6 +68,10 @@ try {
     console.log(`     runtime: ${runtime}`)
     if (remoteBaseUrl) {
       assert.match(runtime ?? '', / on arm64 in /)
+      // CloudFront compresses the HTML and strips Lambda's internal headers.
+      assert.match(response.headers.get('content-encoding') ?? '', /^(br|gzip)$/)
+      assert.equal(response.headers.get('lambda-web-request-id'), null)
+      assert.equal(response.headers.get('lambda-web-logstream'), null)
     }
     // Behind CloudFront this is the Web Function endpoint's hostname.
     console.log(
