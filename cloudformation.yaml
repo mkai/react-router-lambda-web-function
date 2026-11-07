@@ -171,9 +171,11 @@ Resources:
             AllowedMethods: [GET, HEAD]
             CachedMethods: [GET, HEAD]
 
-  # Like Managed-CachingDisabled, but with compression: CloudFront only gzips
-  # or Brotli-compresses responses when the cache policy enables Accept-Encoding
-  # normalization, and that is rejected when every TTL is 0. DefaultTTL 0 means
+  # Like Managed-CachingDisabled, but with Accept-Encoding normalization, which
+  # CloudFront rejects when every TTL is 0. It puts the normalized header in
+  # the cache key and forwards it, so the server can compress streamed HTML
+  # (CloudFront itself only compresses responses with a Content-Length, see
+  # server.ts) and CloudFront still compresses other text. DefaultTTL 0 means
   # nothing is cached unless the app sends Cache-Control (it sends no-store);
   # MaxTTL caps what it can ask for. Cookies and query strings are part of the
   # key, so a response is never reused across sessions or URLs.

@@ -66,10 +66,12 @@ try {
     assert.match(html, /Node\.js .*v24\./)
     const runtime = /data-testid="runtime">(.*?)<\/dd>/.exec(html)?.[1]?.replaceAll('<!-- -->', '')
     console.log(`     runtime: ${runtime}`)
+    // fetch() sends Accept-Encoding and transparently decodes the body; the
+    // server compresses streamed HTML itself (CloudFront can't, see server.ts).
+    assert.match(response.headers.get('content-encoding') ?? '', /^(br|gzip)$/)
     if (remoteBaseUrl) {
       assert.match(runtime ?? '', / on arm64 in /)
-      // CloudFront compresses the HTML and strips Lambda's internal headers.
-      assert.match(response.headers.get('content-encoding') ?? '', /^(br|gzip)$/)
+      // CloudFront strips Lambda's internal headers.
       assert.equal(response.headers.get('lambda-web-request-id'), null)
       assert.equal(response.headers.get('lambda-web-logstream'), null)
     }
