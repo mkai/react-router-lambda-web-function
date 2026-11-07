@@ -133,3 +133,11 @@ The CloudFront URL is shown in the job summary and in the stack outputs (`Distri
 At launch, Web Functions are available in us-east-1, us-east-2, us-west-2, ap-northeast-1 and
 **eu-west-1**. The workflow uses eu-west-1; change `AWS_REGION` in the workflow to pick another
 supported region.
+
+### Teardown
+
+The workflow [`.github/workflows/destroy.yml`](.github/workflows/destroy.yml) deletes the whole
+stack. Run it from the Actions tab ("Destroy stack" → "Run workflow") and type the stack name
+`react-router-web-function` to confirm. It waits until the deletion has finished; the CloudFront
+distribution alone can take several minutes to disable and delete. The artifacts bucket isn't part
+of the stack and is kept.
