@@ -1,0 +1,178 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: React Router SSR app on an AWS Lambda Web Function behind CloudFront
+
+Parameters:
+  Version:
+    Type: String
+    Description: Git commit SHA; selects the deployment package in the artifacts bucket.
+  ArtifactsBucketName:
+    Type: String
+    Description: Bucket (same Region as the stack) holding versions/<Version>/web.zip.
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Lambda Web Function
+  #
+  # A Web Function is three resources: the function itself (just a name), an
+  # immutable revision (code + runtime + service config) and an endpoint that
+  # exposes it over HTTPS and routes traffic to one or two revisions. Every
+  # property of a revision is create-only, so a new Version replaces the
+  # revision: CloudFormation creates the new one, points the endpoint at it,
+  # then deletes the old one in the cleanup phase.
+  # ---------------------------------------------------------------------------
+  WebFunction:
+    Type: AWS::Lambda::WebFunction
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-web
+
+  WebFunctionRevision:
+    Type: AWS::Lambda::WebFunctionRevision
+    DependsOn: WebFunction
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-web
+      Description: !Ref Version
+      BuildConfig:
+        CodeConfig:
+          S3Object:
+            Bucket: !Ref ArtifactsBucketName
+            Key: !Sub versions/${Version}/web.zip
+        RuntimeConfig:
+          # Node.js 24 on arm64; Web Functions have no architecture setting.
+          Runtime: nodejs24.x
+      ServiceConfig:
+        ExecutionRoleArn: !GetAtt WebFunctionExecutionRole.Arn
+        TimeoutSeconds: 10
+        EnvironmentVariables:
+          NODE_ENV: production
+        TelemetryConfig:
+          LoggingConfig:
+            LogGroup: !Ref WebFunctionLogGroup
+
+  WebFunctionEndpoint:
+    Type: AWS::Lambda::WebFunctionEndpoint
+    DependsOn: WebFunction
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-web
+      EndpointName: live
+      EndpointType: HomeRegion
+      # IamAuth: every request must be SigV4-signed by a principal the resource
+      # policy below allows. Only the CloudFront distribution (via OAC) is, so
+      # the endpoint's own domain answers direct requests with 403.
+      AuthType: IamAuth
+      RevisionWeights:
+        - RevisionId: !GetAtt WebFunctionRevision.RevisionId
+          Weight: 100
+      # Cost guard for this test setup; each environment serves up to 64
+      # concurrent requests by default.
+      ScalingConfig:
+        MaxEnvironments: 2
+
+  WebFunctionResourcePolicy:
+    Type: AWS::Lambda::ResourcePolicy
+    Properties:
+      ResourceArn: !GetAtt WebFunction.FunctionArn
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontDistribution
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: lambda:InvokeWebFunctionEndpoint
+            Resource: !GetAtt WebFunctionEndpoint.EndpointArn
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+
+  WebFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/web/${AWS::StackName}-web
+      RetentionInDays: 7
+
+  WebFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WriteLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt WebFunctionLogGroup.Arn
+
+  # ---------------------------------------------------------------------------
+  # CloudFront
+  # ---------------------------------------------------------------------------
+  # Web Function origins need their own OAC flavour: origin type `lambda` with
+  # signing behavior `always-amz-auth` (the only one CloudFront accepts for
+  # them). Unlike Function URL OAC, POST/PUT bodies need no client-computed
+  # x-amz-content-sha256 header.
+  WebFunctionOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-web-function
+        OriginAccessControlOriginType: lambda
+        SigningBehavior: always-amz-auth
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub ${AWS::StackName}
+        Enabled: true
+        PriceClass: PriceClass_100
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: WebFunction
+            DomainName: !GetAtt WebFunctionEndpoint.DomainName
+            OriginAccessControlId: !GetAtt WebFunctionOriginAccessControl.Id
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: WebFunction
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # Managed-CachingDisabled
+          # Forwards cookies, query strings and viewer headers (including Origin,
+          # which React Router checks on POST against allowedActionOrigins in
+          # react-router.config.ts), but keeps Host as the endpoint's domain.
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # Managed-AllViewerExceptHostHeader
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+          CachedMethods: [GET, HEAD]
+        CacheBehaviors:
+          # Hashed, immutable Vite build output. Served by the Web Function
+          # itself and cached at the edge, so there's no S3 bucket to manage.
+          - PathPattern: /assets/*
+            TargetOriginId: WebFunction
+            ViewerProtocolPolicy: redirect-to-https
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+
+Outputs:
+  DistributionUrl:
+    Description: Public URL of the app
+    Value: !Sub https://${CloudFrontDistribution.DomainName}
+  EndpointUrl:
+    Description: Web Function endpoint (IamAuth; direct requests are rejected)
+    Value: !Sub https://${WebFunctionEndpoint.DomainName}
