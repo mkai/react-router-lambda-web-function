@@ -1,146 +1,135 @@
-# React Router auf AWS Lambda Web Functions
+# React Router on AWS Lambda Web Functions
 
-Minimale React-Router-App (v8, SSR) auf einer
+A minimal React Router app (v8, server-side rendering) running on an
 [AWS Lambda Web Function](https://docs.aws.amazon.com/lambda/latest/dg/web-functions-runtimes.html)
-(Node.js 24, arm64). Die Web Function ist nur über CloudFront erreichbar. Deployt wird per
-CloudFormation aus GitHub Actions. Es gibt keine eigene Domain, die App läuft unter der
-`*.cloudfront.net`-URL der Distribution.
+(Node.js 24, arm64). The Web Function can only be reached through CloudFront. Deployment is done
+with CloudFormation from GitHub Actions. There is no custom domain: the app is served from the
+distribution's `*.cloudfront.net` URL.
 
-Vorlage war das Fetchbot-Repository (`cloudformation.yaml`, `.github/workflows/ci.yml`,
-`apps/web`). Alles, was für diesen Test nicht nötig ist, ist weggelassen: Monorepo, S3-Bucket für
-Assets, API, DynamoDB, Basic Auth, WAF, Route 53 und ACM.
+The setup is deliberately small. It has no asset bucket, no database, no custom domain and no WAF,
+only what it takes to run a website as a Web Function behind CloudFront.
 
-## Architektur
+## Architecture
 
 ```
-Browser ──HTTPS──▶ CloudFront ──SigV4 (OAC)──▶ Web Function Endpoint (IamAuth) ──▶ Node-HTTP-Server
+Browser ──HTTPS──▶ CloudFront ──SigV4 (OAC)──▶ Web Function endpoint (IamAuth) ──▶ Node HTTP server
                     │                                                               (node:http + React Router)
-                    ├─ /assets/*  → CachingOptimized (immutable, vom Server ausgeliefert)
-                    └─ /*         → CachingDisabled, AllViewerExceptHostHeader
+                    ├─ /assets/*  → CachingOptimized (immutable, served by the function)
+                    └─ /*         → dynamic cache policy (TTL 0, compression), AllViewerExceptHostHeader
 ```
 
-| Ressource                              | Zweck                                                                     |
-| -------------------------------------- | ------------------------------------------------------------------------- |
-| `AWS::Lambda::WebFunction`             | Die Funktion selbst (nur Name/Tags)                                       |
-| `AWS::Lambda::WebFunctionRevision`     | Code (`s3://…/versions/<sha>/web.zip`), `nodejs24.x`, Rolle, Timeout, Env |
-| `AWS::Lambda::WebFunctionEndpoint`     | HTTPS-Endpoint, `AuthType: IamAuth`, 100 % Traffic auf die neue Revision  |
-| `AWS::Lambda::ResourcePolicy`          | Nur `cloudfront.amazonaws.com` mit `aws:SourceArn` = diese Distribution   |
-| `AWS::CloudFront::OriginAccessControl` | Typ `lambda`, Signing `always-amz-auth`, `sigv4`                          |
-| `AWS::CloudFront::Distribution`        | Default-Zertifikat, kein Alias                                            |
+| Resource                                 | Purpose                                                                       |
+| ---------------------------------------- | ----------------------------------------------------------------------------- |
+| `AWS::Lambda::WebFunction`               | The function itself (name and tags only)                                      |
+| `AWS::Lambda::WebFunctionRevision`       | Code (`s3://…/versions/<sha>/web.zip`), `nodejs24.x`, role, timeout, env vars |
+| `AWS::Lambda::WebFunctionEndpoint`       | HTTPS endpoint, `AuthType: IamAuth`, 100% of traffic to the new revision      |
+| `AWS::Lambda::ResourcePolicy`            | Only `cloudfront.amazonaws.com` with `aws:SourceArn` = this distribution      |
+| `AWS::CloudFront::OriginAccessControl`   | Type `lambda`, signing behavior `always-amz-auth`, `sigv4`                    |
+| `AWS::CloudFront::CachePolicy`           | No caching for HTML, but gzip/Brotli compression                              |
+| `AWS::CloudFront::ResponseHeadersPolicy` | Removes `lambda-web-request-id` and `lambda-web-logstream`                    |
+| `AWS::CloudFront::Distribution`          | Default certificate, no alias                                                 |
 
-Weil alle Properties einer Revision create-only sind, ersetzt jeder Commit die Revision.
-CloudFormation legt zuerst die neue an, schaltet den Endpoint um und löscht die alte danach.
+All properties of a revision are create-only, so every commit replaces the revision.
+CloudFormation creates the new one first, switches the endpoint to it, and then deletes the old one.
 
-## Brauchen wir einen Adapter?
+## Do you need an adapter?
 
-**Nein.** Eine Web Function bekommt keine Events. Lambda startet `index.js` aus dem Paket-Root,
-und die App muss einen ganz normalen HTTP-Server auf der Adresse aus `AWS_LAMBDA_HTTP_ENDPOINT`
-(`host:port`) starten. Hier ist das `node:http` mit `createRequestListener` aus dem offiziellen
-`@react-router/node` ([`server.ts`](server.ts)), also ohne Express oder ein anderes Framework. Das
-ist dasselbe Setup wie bei jedem anderen Node-Hosting. Die paar Dateien aus `build/client` lädt der
-Server beim Start in den Speicher und liefert sie über eine Lookup-Tabelle aus. Pfade, die nicht im
-Build liegen, landen nie im Dateisystem.
+**No.** A Web Function doesn't receive events. Lambda runs `index.js` from the package root, and
+the app starts an ordinary HTTP server on the address in `AWS_LAMBDA_HTTP_ENDPOINT` (`host:port`).
+Here that is `node:http` with `createRequestListener` from the official `@react-router/node`
+([`server.ts`](server.ts)), without Express or any other framework. It is the same setup as on any
+other Node host. The server loads the handful of files in `build/client` into memory at startup
+and serves them from a lookup table, so paths that aren't in the build never touch the file system.
 
 ### `@geostrategists/react-router-aws`
 
-Der Adapter (v3.0.0) passt **nicht** zu Web Functions. Er exportiert nur Event-Handler:
+This adapter (v3.0.0) does **not** fit Web Functions. It only exports event handlers:
 `createAPIGatewayV1RequestHandler`, `createAPIGatewayV2RequestHandler`, `createALBRequestHandler`,
-`createFunctionURLRequestHandler` und `createFunctionURLStreamingRequestHandler`. Alle haben die
-Signatur `(event, context)` und übersetzen API-Gateway-, ALB- oder Function-URL-Events in einen
-Fetch-`Request`. Eine Web Function ruft aber keinen Handler auf, sondern spricht HTTP mit einem
-Server, der auf einem Port lauscht. Den Adapter gibt es nur, um diese Lücke zu schließen, und bei
-Web Functions gibt es sie nicht mehr.
+`createFunctionURLRequestHandler` and `createFunctionURLStreamingRequestHandler`. All of them have
+the signature `(event, context)` and translate API Gateway, ALB or Function URL events into a fetch
+`Request`. A Web Function doesn't call a handler; it talks HTTP to a server listening on a port. The
+adapter exists to bridge that gap, and with Web Functions the gap is gone.
 
-Damit entfallen auch die Workarounds aus Fetchbot:
+### Migrating from a Function URL setup
 
-- der `awslambda`-Global-Stub in `build.lambda.mjs`,
-- `getHost` mit `x-forwarded-host`,
-- `setDefaultCacheControl`,
-- der `x-origin-secret`-Check. Den ersetzen OAC und `IamAuth`.
+If your app currently runs on a classic Lambda function with a Function URL behind CloudFront, the
+typical workarounds of that setup go away:
 
-Für Fetchbot heißt das: `apps/web/server.ts` wird durch einen normalen Node-Server wie hier ersetzt,
-und `AWS::Lambda::Function` + `AWS::Lambda::Url` + `AWS::Lambda::Permission` werden zu den drei
-`WebFunction*`-Ressourcen + `ResourcePolicy` + OAC.
+- the stub for the Lambda-only `awslambda` global that the adapter needs off Lambda,
+- rewriting the host from `x-forwarded-host` so URLs use the public domain,
+- a shared-secret header that CloudFront injects and the function checks. OAC with `IamAuth`
+  replaces it.
 
-### POST hinter CloudFront: `allowedActionOrigins`
+In CloudFormation, `AWS::Lambda::Function` + `AWS::Lambda::Url` + `AWS::Lambda::Permission` become
+the three `WebFunction*` resources + `ResourcePolicy` + OAC.
 
-CloudFront schickt der Origin deren eigenen Hostnamen als `Host`. React Router baut `request.url`
-aus dem Host und lehnt Actions (POST) ab, deren `Origin`-Header nicht passt. Ohne Gegenmaßnahme
-funktionieren GET-Requests, aber jeder Form-Submit liefert 400.
+### POST behind CloudFront: `allowedActionOrigins`
 
-Gelöst ist das mit `allowedActionOrigins: ['*.cloudfront.net']` in
-[`react-router.config.ts`](react-router.config.ts). Eine CloudFront Function ist dafür nicht nötig.
-Die genaue Distribution-Domain lässt sich nicht eintragen: Sie steht erst nach dem Deploy fest, und
-als Umgebungsvariable entstünde eine zirkuläre Abhängigkeit (Revision → Distribution → Endpoint →
-Revision). Das hat zwei Folgen:
+CloudFront sends the origin its own hostname as `Host`. React Router builds `request.url` from that
+host and rejects actions (POST) whose `Origin` header doesn't match it. Without a countermeasure,
+GET requests work but every form submit returns 400.
 
-- Jede `*.cloudfront.net`-Seite gilt als erlaubter Absender für POSTs. Andere Origins werden
-  weiterhin abgelehnt. Für diese App ohne Login spielt das keine Rolle. Mit Sessions zusätzlich
-  `SameSite=Lax`-Cookies verwenden.
-- `request.url` enthält den Hostnamen des Web-Function-Endpoints, nicht die CloudFront-URL.
-  Relative Redirects funktionieren. Absolute URLs aus dem Request (zum Beispiel Canonical-Links)
-  wären falsch.
+This app solves it with `allowedActionOrigins: ['*.cloudfront.net']` in
+[`react-router.config.ts`](react-router.config.ts), so no CloudFront Function is needed. The exact
+distribution domain can't be configured: it is only known after deployment, and passing it in as an
+environment variable would create a circular dependency (revision → distribution → endpoint →
+revision). That has two consequences:
 
-Mit eigener Domain trägt man stattdessen genau diese Domain ein, zum Beispiel
+- Any `*.cloudfront.net` site counts as an allowed origin for POSTs. All other origins are still
+  rejected. For this app without login that doesn't matter. With sessions, also use
+  `SameSite=Lax` cookies.
+- `request.url` contains the Web Function endpoint's hostname, not the CloudFront URL. Relative
+  redirects work. Absolute URLs built from the request (canonical links, for example) would be
+  wrong.
+
+With a custom domain, list exactly that domain instead, for example
 `allowedActionOrigins: ['example.com']`.
 
-## Lokal
+## Local development
 
 ```sh
 npm ci
-npm run dev        # Vite-Dev-Server mit HMR
-npm run build      # react-router build + esbuild → dist/ (= Deployment-Paket)
-npm start          # startet dist/index.js auf 127.0.0.1:3000 (oder AWS_LAMBDA_HTTP_ENDPOINT)
-npm run smoke      # startet dist/index.js wie Lambda und testet GET, Assets, POST, fremde Origin
+npm run dev        # Vite dev server with HMR
+npm run build      # react-router build + esbuild → dist/ (= deployment package)
+npm start          # runs dist/index.js on 127.0.0.1:3000 (or AWS_LAMBDA_HTTP_ENDPOINT)
+npm run smoke      # starts dist/index.js like Lambda does; tests GET, assets, POST, foreign origin
 npm run check      # format:check + typecheck + build + smoke
 ```
 
-`dist/` enthält nur `index.js` (Server + React-Router-Build, gebündelt), `package.json`
-(`"type": "module"`) und `client/`. `node_modules` werden nicht mitgeliefert.
+`dist/` contains only `index.js` (server and React Router build, bundled), `package.json`
+(`"type": "module"`) and `client/`. No `node_modules` are shipped.
 
 ## Deployment
 
-Der Workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) läuft so:
+The workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) works like this:
 
-1. **Check & build** (jeder Push/PR): cfn-lint, `npm run check`, `dist/` zippen und als Artifact
-   hochladen.
-2. **Deploy** (nur `main`, auch manuell per `workflow_dispatch`):
-   - `web.zip` nach `s3://react-router-web-function-artifacts-<account-id>/versions/<sha>/`
-     hochladen. Der Bucket wird bei Bedarf angelegt. Eine Web-Function-Revision kopiert den Code
-     nicht, sondern liest ihn direkt aus dem Bucket. Deshalb ist der Bucket versioniert, und eine
-     Bucket Policy erlaubt dem Lambda-Service (`lambda.amazonaws.com`, nur aus diesem Konto)
-     `s3:GetObject` und `s3:GetObjectVersion` auf `versions/*`. Pakete, die eine aktive Revision
-     noch nutzt, dürfen nicht gelöscht werden.
-   - Stack `react-router-web-function` in **eu-west-1** deployen.
-   - Smoke-Test gegen die CloudFront-URL: SSR auf arm64, Assets, POST, fremde Origin.
-   - Prüfen, dass ein direkter Aufruf des Web-Function-Endpoints **403** liefert.
+1. **Check & build** (every push and PR): cfn-lint, `npm run check`, zip `dist/` and upload it as a
+   workflow artifact.
+2. **Deploy** (`main` only, or manually via `workflow_dispatch`):
+   - Upload `web.zip` to `s3://react-router-web-function-artifacts-<account-id>/versions/<sha>/`.
+     The bucket is created if needed. A Web Function revision doesn't copy the code; Lambda reads it
+     straight from the bucket. That's why the bucket is versioned and a bucket policy allows the
+     Lambda service (`lambda.amazonaws.com`, from this account only) `s3:GetObject` and
+     `s3:GetObjectVersion` on `versions/*`. Don't delete packages that a live revision still uses.
+   - Deploy the stack `react-router-web-function` to **eu-west-1**.
+   - Smoke test through the CloudFront URL: SSR on arm64, compression, stripped Lambda headers,
+     assets, POST, foreign origin.
+   - Check that a direct request to the Web Function endpoint returns **403**.
 
-Die CloudFront-URL steht in der Job-Summary und in den Stack-Outputs (`DistributionUrl`).
+The CloudFront URL is shown in the job summary and in the stack outputs (`DistributionUrl`).
 
-### Einrichtung
+### Setup
 
-- Repository-Variable `AWS_ACCESS_KEY_ID` und Secret `AWS_SECRET_ACCESS_KEY`, wie bei Fetchbot.
-- Der IAM-User braucht Rechte für CloudFormation, `lambda:*WebFunction*` sowie
-  `lambda:PutResourcePolicy`, `GetResourcePolicy` und `DeleteResourcePolicy`, außerdem
-  `iam:CreateRole`/`PassRole`, CloudFront, CloudWatch Logs, S3 (inklusive
-  `s3:PutBucketVersioning`, `s3:PutBucketPolicy` und `s3:GetObjectVersion`) und
-  `sts:GetCallerIdentity`.
+- Repository variable `AWS_ACCESS_KEY_ID` and secret `AWS_SECRET_ACCESS_KEY`.
+- The IAM user needs permissions for CloudFormation, `lambda:*WebFunction*`,
+  `lambda:PutResourcePolicy`, `GetResourcePolicy` and `DeleteResourcePolicy`, plus
+  `iam:CreateRole`/`PassRole`, CloudFront, CloudWatch Logs, S3 (including `s3:PutBucketVersioning`,
+  `s3:PutBucketPolicy` and `s3:GetObjectVersion`) and `sts:GetCallerIdentity`.
+- If the very first deploy fails, the stack ends up in `ROLLBACK_COMPLETE`. CloudFormation can't
+  update a stack in that state, so delete it before the next attempt.
 
 ### Region
 
-Web Functions gibt es bisher nur in us-east-1, us-east-2, us-west-2, ap-northeast-1 und
-**eu-west-1**. Fetchbots eu-central-1 ist nicht dabei, deshalb verwendet der Workflow eu-west-1.
-Geändert wird das über `AWS_REGION` im Workflow.
-
-## Noch nicht gegen AWS verifiziert
-
-Der lokale Smoke-Test simuliert CloudFront, indem er beim POST eine `*.cloudfront.net`-Origin
-schickt, die nicht zum Host passt. Erst der Deploy-Job zeigt, ob die Kette mit echter OAC
-funktioniert. Darauf kommt es an:
-
-- CloudFront leitet `Origin` über `AllViewerExceptHostHeader` an die Web Function weiter, und
-  Lambda reicht den Header unverändert an den Server durch.
-- POST-Bodies gehen mit `always-amz-auth` ohne `x-amz-content-sha256` durch. Laut AWS-Doku ist
-  das bei Web Functions so, anders als bei Function URLs.
-- Die Resource Policy mit `Resource: <EndpointArn>` und `Action: lambda:InvokeWebFunctionEndpoint`
-  reicht aus.
+At launch, Web Functions are available in us-east-1, us-east-2, us-west-2, ap-northeast-1 and
+**eu-west-1**. The workflow uses eu-west-1; change `AWS_REGION` in the workflow to pick another
+supported region.
