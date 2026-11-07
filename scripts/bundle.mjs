@@ -23,8 +23,8 @@ await build({
     // React and React Router pick their production builds from this.
     'process.env.NODE_ENV': '"production"',
   },
-  // Express and some of its dependencies are CommonJS and call require() for
-  // Node built-ins; give the ESM bundle a real require().
+  // react-dom/server is CommonJS and calls require() for Node built-ins
+  // (util, stream, …); give the ESM bundle a real require().
   banner: {
     js: "import { createRequire as __createRequire } from 'node:module'; const require = __createRequire(import.meta.url);",
   },

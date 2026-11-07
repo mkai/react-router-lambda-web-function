@@ -1,6 +1,7 @@
+import { readdirSync, readFileSync } from 'node:fs'
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import path from 'node:path'
-import { createRequestHandler } from '@react-router/express'
-import express from 'express'
+import { createRequestListener } from '@react-router/node'
 // Resolved by Vite's typegen for type-checking and aliased to
 // ./build/server/index.js by scripts/bundle.mjs, so the React Router server
 // build ends up inside the single bundled dist/index.js.
@@ -22,45 +23,76 @@ function listenAddress(): { host: string; port: number } {
   return { host: process.env['HOST'] ?? '127.0.0.1', port: Number(process.env['PORT'] ?? 3000) }
 }
 
-const app = express()
-app.disable('x-powered-by')
+type StaticFile = { body: Buffer; contentType: string; cacheControl: string }
 
-// Behind CloudFront the Host header the server sees is the Web Function
-// endpoint's domain, not the CloudFront domain the browser uses. React Router
-// derives request.url from the host and rejects actions (POST) whose `Origin`
-// header doesn't match it. The CloudFront viewer-request function copies the
-// viewer's Host into `x-viewer-host` (overwriting anything a client sent), and
-// we pin Host/X-Forwarded-Host/-Proto to it; the Express adapter reads them
-// when "trust proxy" is enabled (it takes the port from Host, so Host must be
-// rewritten too). Client-supplied X-Forwarded-* are dropped otherwise.
-app.set('trust proxy', true)
-app.use((req, _res, next) => {
-  const viewerHost = req.get('x-viewer-host')
-  if (viewerHost) {
-    req.headers['host'] = viewerHost
-    req.headers['x-forwarded-host'] = viewerHost
-    req.headers['x-forwarded-proto'] = 'https'
-  } else {
-    delete req.headers['x-forwarded-host']
-    delete req.headers['x-forwarded-proto']
+const CONTENT_TYPES: Record<string, string> = {
+  '.css': 'text/css; charset=utf-8',
+  '.ico': 'image/x-icon',
+  '.js': 'text/javascript; charset=utf-8',
+  '.json': 'application/json',
+  '.png': 'image/png',
+  '.svg': 'image/svg+xml',
+  '.txt': 'text/plain; charset=utf-8',
+  '.webp': 'image/webp',
+  '.woff2': 'font/woff2',
+}
+
+// The Vite client build is small, so load it into memory once at startup and
+// serve it from a lookup table keyed by URL path. Only files that exist in the
+// build can match, which rules out path traversal. CloudFront caches these,
+// so the function serves each file roughly once per edge location.
+function loadStaticFiles(dir: string): Map<string, StaticFile> {
+  const files = new Map<string, StaticFile>()
+  for (const entry of readdirSync(dir, { recursive: true, withFileTypes: true })) {
+    if (!entry.isFile()) {
+      continue
+    }
+    const filePath = path.join(entry.parentPath, entry.name)
+    const urlPath = `/${path.relative(dir, filePath).split(path.sep).join('/')}`
+    if (urlPath.startsWith('/.vite/')) {
+      continue
+    }
+    files.set(urlPath, {
+      body: readFileSync(filePath),
+      contentType: CONTENT_TYPES[path.extname(filePath)] ?? 'application/octet-stream',
+      // Hashed Vite output under /assets never changes; everything else may.
+      cacheControl: urlPath.startsWith('/assets/')
+        ? 'public, max-age=31536000, immutable'
+        : 'public, max-age=3600',
+    })
   }
-  next()
+  return files
+}
+
+const staticFiles = loadStaticFiles(path.join(import.meta.dirname, 'client'))
+
+function serveStaticFile(req: IncomingMessage, res: ServerResponse): boolean {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    return false
+  }
+  const file = staticFiles.get(new URL(req.url ?? '/', 'http://localhost').pathname)
+  if (!file) {
+    return false
+  }
+  res.writeHead(200, {
+    'content-type': file.contentType,
+    'content-length': file.body.length,
+    'cache-control': file.cacheControl,
+  })
+  res.end(req.method === 'HEAD' ? undefined : file.body)
+  return true
+}
+
+const handleRequest = createRequestListener({ build })
+
+const server = createServer((req, res) => {
+  if (!serveStaticFile(req, res)) {
+    void handleRequest(req, res)
+  }
 })
 
-// Static files from the Vite client build. CloudFront caches them, so the
-// function only serves each file once per edge location. Hashed files under
-// /assets are immutable.
-const clientDir = path.join(import.meta.dirname, 'client')
-app.use(
-  '/assets',
-  express.static(path.join(clientDir, 'assets'), { immutable: true, maxAge: '1y', index: false }),
-)
-app.use(express.static(clientDir, { maxAge: '1h', index: false }))
-
-app.all('/{*splat}', createRequestHandler({ build }))
-
 const { host, port } = listenAddress()
-const server = app.listen(port, host, () => {
+server.listen(port, host, () => {
   console.log(`Server listening on http://${host}:${port}`)
 })
 

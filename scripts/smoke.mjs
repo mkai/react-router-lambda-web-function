@@ -4,22 +4,20 @@
 //   node scripts/smoke.mjs https://dxxxx.cloudfront.net   # tests a deployment
 //
 // Locally the server is started the way Lambda starts it: with the listen
-// address in AWS_LAMBDA_HTTP_ENDPOINT. Requests then carry the `x-viewer-host`
-// header that the CloudFront viewer-request function adds in production.
+// address in AWS_LAMBDA_HTTP_ENDPOINT. Form submits then send an Origin of a
+// made-up CloudFront domain, which differs from the host the server sees,
+// exactly as behind CloudFront.
 import { spawn } from 'node:child_process'
 import assert from 'node:assert/strict'
 
 const remoteBaseUrl = process.argv[2]
-const viewerHost = 'd1234example.cloudfront.net'
 
 let server
 let baseUrl = remoteBaseUrl
-let simulatedCloudFrontHeaders = {}
 
 if (!remoteBaseUrl) {
   const address = '127.0.0.1:9321'
   baseUrl = `http://${address}`
-  simulatedCloudFrontHeaders = { 'x-viewer-host': viewerHost }
   server = spawn(process.execPath, ['dist/index.js'], {
     env: { ...process.env, AWS_LAMBDA_HTTP_ENDPOINT: address },
     stdio: ['ignore', 'inherit', 'inherit'],
@@ -27,7 +25,9 @@ if (!remoteBaseUrl) {
   await waitForServer(baseUrl)
 }
 
-const publicOrigin = remoteBaseUrl ? new URL(remoteBaseUrl).origin : `https://${viewerHost}`
+const publicOrigin = remoteBaseUrl
+  ? new URL(remoteBaseUrl).origin
+  : 'https://d1234example.cloudfront.net'
 
 async function waitForServer(url) {
   const deadline = Date.now() + 10_000
@@ -59,7 +59,7 @@ try {
   let html = ''
 
   await check('GET / renders on the server', async () => {
-    const response = await fetch(baseUrl, { headers: simulatedCloudFrontHeaders })
+    const response = await fetch(baseUrl)
     assert.equal(response.status, 200)
     html = await response.text()
     assert.match(html, /data-testid="rendered-at"/)
@@ -69,23 +69,24 @@ try {
     if (remoteBaseUrl) {
       assert.match(runtime ?? '', / on arm64 in /)
     }
-    // The server must see the public URL, not the origin's own hostname.
-    assert.match(html, new RegExp(`data-testid="request-url">${publicOrigin}/<`))
+    // Behind CloudFront this is the Web Function endpoint's hostname.
+    console.log(
+      `     request URL seen by server: ${/data-testid="request-url">(.*?)<\/dd>/.exec(html)?.[1]}`,
+    )
   })
 
   await check('GET /assets/* is served with immutable caching', async () => {
     const asset = /href="(\/assets\/[^"]+\.js)"/.exec(html)?.[1]
     assert.ok(asset, 'no /assets/*.js link in the HTML')
-    const response = await fetch(new URL(asset, baseUrl), { headers: simulatedCloudFrontHeaders })
+    const response = await fetch(new URL(asset, baseUrl))
     assert.equal(response.status, 200)
     assert.match(response.headers.get('cache-control') ?? '', /immutable/)
   })
 
-  await check('POST /?index runs the action (same-origin form submit)', async () => {
+  await check('POST /?index from the CloudFront origin runs the action', async () => {
     const response = await fetch(actionUrl(), {
       method: 'POST',
       headers: {
-        ...simulatedCloudFrontHeaders,
         origin: publicOrigin,
         'content-type': 'application/x-www-form-urlencoded',
       },
@@ -99,7 +100,6 @@ try {
     const response = await fetch(actionUrl(), {
       method: 'POST',
       headers: {
-        ...simulatedCloudFrontHeaders,
         origin: 'https://evil.example',
         'content-type': 'application/x-www-form-urlencoded',
       },

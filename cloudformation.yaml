@@ -128,25 +128,6 @@ Resources:
         SigningBehavior: always-amz-auth
         SigningProtocol: sigv4
 
-  # The origin sees its own endpoint domain as Host. Pass the viewer's host on
-  # in a header the server trusts (see server.ts) so React Router builds URLs
-  # for, and runs its action origin check against, the CloudFront domain.
-  # Overwriting it here means clients can't inject their own value.
-  ViewerRequestFunction:
-    Type: AWS::CloudFront::Function
-    Properties:
-      Name: !Sub ${AWS::StackName}-viewer-request
-      AutoPublish: true
-      FunctionConfig:
-        Comment: Forward the viewer Host header as x-viewer-host
-        Runtime: cloudfront-js-2.0
-      FunctionCode: |
-        function handler(event) {
-          var request = event.request
-          request.headers['x-viewer-host'] = { value: request.headers.host.value }
-          return request
-        }
-
   CloudFrontDistribution:
     Type: AWS::CloudFront::Distribution
     Properties:
@@ -171,12 +152,12 @@ Resources:
           ViewerProtocolPolicy: redirect-to-https
           Compress: true
           CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # Managed-CachingDisabled
+          # Forwards cookies, query strings and viewer headers (including Origin,
+          # which React Router checks on POST against allowedActionOrigins in
+          # react-router.config.ts), but keeps Host as the endpoint's domain.
           OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # Managed-AllViewerExceptHostHeader
           AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
           CachedMethods: [GET, HEAD]
-          FunctionAssociations:
-            - EventType: viewer-request
-              FunctionARN: !GetAtt ViewerRequestFunction.FunctionMetadata.FunctionARN
         CacheBehaviors:
           # Hashed, immutable Vite build output. Served by the Web Function
           # itself and cached at the edge, so there's no S3 bucket to manage.

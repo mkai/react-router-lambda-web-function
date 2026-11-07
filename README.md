@@ -14,9 +14,9 @@ Assets, API, DynamoDB, Basic Auth, WAF, Route 53 und ACM.
 
 ```
 Browser ──HTTPS──▶ CloudFront ──SigV4 (OAC)──▶ Web Function Endpoint (IamAuth) ──▶ Node-HTTP-Server
-                    │                                                               (Express + React Router)
+                    │                                                               (node:http + React Router)
                     ├─ /assets/*  → CachingOptimized (immutable, vom Server ausgeliefert)
-                    └─ /*         → CachingDisabled, AllViewerExceptHostHeader, viewer-request function
+                    └─ /*         → CachingDisabled, AllViewerExceptHostHeader
 ```
 
 | Ressource                              | Zweck                                                                     |
@@ -26,7 +26,6 @@ Browser ──HTTPS──▶ CloudFront ──SigV4 (OAC)──▶ Web Function 
 | `AWS::Lambda::WebFunctionEndpoint`     | HTTPS-Endpoint, `AuthType: IamAuth`, 100 % Traffic auf die neue Revision  |
 | `AWS::Lambda::ResourcePolicy`          | Nur `cloudfront.amazonaws.com` mit `aws:SourceArn` = diese Distribution   |
 | `AWS::CloudFront::OriginAccessControl` | Typ `lambda`, Signing `always-amz-auth`, `sigv4`                          |
-| `AWS::CloudFront::Function`            | Gibt den Viewer-Host als `x-viewer-host` an den Server weiter             |
 | `AWS::CloudFront::Distribution`        | Default-Zertifikat, kein Alias                                            |
 
 Weil alle Properties einer Revision create-only sind, ersetzt jeder Commit die Revision.
@@ -36,9 +35,11 @@ CloudFormation legt zuerst die neue an, schaltet den Endpoint um und löscht die
 
 **Nein.** Eine Web Function bekommt keine Events. Lambda startet `index.js` aus dem Paket-Root,
 und die App muss einen ganz normalen HTTP-Server auf der Adresse aus `AWS_LAMBDA_HTTP_ENDPOINT`
-(`host:port`) starten. Hier ist das ein kleiner Express-Server
-([`server.ts`](server.ts)) mit dem offiziellen `@react-router/express`-Handler. Das ist dasselbe
-Setup wie bei jedem anderen Node-Hosting.
+(`host:port`) starten. Hier ist das `node:http` mit `createRequestListener` aus dem offiziellen
+`@react-router/node` ([`server.ts`](server.ts)), also ohne Express oder ein anderes Framework. Das
+ist dasselbe Setup wie bei jedem anderen Node-Hosting. Die paar Dateien aus `build/client` lädt der
+Server beim Start in den Speicher und liefert sie über eine Lookup-Tabelle aus. Pfade, die nicht im
+Build liegen, landen nie im Dateisystem.
 
 ### `@geostrategists/react-router-aws`
 
@@ -61,13 +62,27 @@ Für Fetchbot heißt das: `apps/web/server.ts` wird durch einen normalen Node-Se
 und `AWS::Lambda::Function` + `AWS::Lambda::Url` + `AWS::Lambda::Permission` werden zu den drei
 `WebFunction*`-Ressourcen + `ResourcePolicy` + OAC.
 
-### Eine Stelle braucht trotzdem etwas Klebstoff: der Host
+### POST hinter CloudFront: `allowedActionOrigins`
 
 CloudFront schickt der Origin deren eigenen Hostnamen als `Host`. React Router baut `request.url`
-aus dem Host und lehnt Actions (POST) ab, deren `Origin` nicht passt. Die viewer-request function
-schreibt deshalb den Viewer-Host in `x-viewer-host` und überschreibt dabei jeden Wert, den ein
-Client mitschickt. `server.ts` setzt daraus `Host`, `X-Forwarded-Host` und `X-Forwarded-Proto`.
-Ohne diese Stelle funktionieren GET-Requests, aber jeder Form-Submit liefert 400.
+aus dem Host und lehnt Actions (POST) ab, deren `Origin`-Header nicht passt. Ohne Gegenmaßnahme
+funktionieren GET-Requests, aber jeder Form-Submit liefert 400.
+
+Gelöst ist das mit `allowedActionOrigins: ['*.cloudfront.net']` in
+[`react-router.config.ts`](react-router.config.ts). Eine CloudFront Function ist dafür nicht nötig.
+Die genaue Distribution-Domain lässt sich nicht eintragen: Sie steht erst nach dem Deploy fest, und
+als Umgebungsvariable entstünde eine zirkuläre Abhängigkeit (Revision → Distribution → Endpoint →
+Revision). Das hat zwei Folgen:
+
+- Jede `*.cloudfront.net`-Seite gilt als erlaubter Absender für POSTs. Andere Origins werden
+  weiterhin abgelehnt. Für diese App ohne Login spielt das keine Rolle. Mit Sessions zusätzlich
+  `SameSite=Lax`-Cookies verwenden.
+- `request.url` enthält den Hostnamen des Web-Function-Endpoints, nicht die CloudFront-URL.
+  Relative Redirects funktionieren. Absolute URLs aus dem Request (zum Beispiel Canonical-Links)
+  wären falsch.
+
+Mit eigener Domain trägt man stattdessen genau diese Domain ein, zum Beispiel
+`allowedActionOrigins: ['example.com']`.
 
 ## Lokal
 
@@ -76,7 +91,7 @@ npm ci
 npm run dev        # Vite-Dev-Server mit HMR
 npm run build      # react-router build + esbuild → dist/ (= Deployment-Paket)
 npm start          # startet dist/index.js auf 127.0.0.1:3000 (oder AWS_LAMBDA_HTTP_ENDPOINT)
-npm run smoke      # startet dist/index.js wie Lambda und testet GET, Assets, POST, CSRF
+npm run smoke      # startet dist/index.js wie Lambda und testet GET, Assets, POST, fremde Origin
 npm run check      # format:check + typecheck + build + smoke
 ```
 
@@ -93,7 +108,7 @@ Der Workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) läuft so:
    - `web.zip` nach `s3://react-router-web-function-artifacts-<account-id>/versions/<sha>/`
      hochladen. Der Bucket wird bei Bedarf angelegt.
    - Stack `react-router-web-function` in **eu-west-1** deployen.
-   - Smoke-Test gegen die CloudFront-URL: SSR, Assets, POST, CSRF.
+   - Smoke-Test gegen die CloudFront-URL: SSR auf arm64, Assets, POST, fremde Origin.
    - Prüfen, dass ein direkter Aufruf des Web-Function-Endpoints **403** liefert.
 
 Die CloudFront-URL steht in der Job-Summary und in den Stack-Outputs (`DistributionUrl`).
@@ -113,11 +128,12 @@ Geändert wird das über `AWS_REGION` im Workflow.
 
 ## Noch nicht gegen AWS verifiziert
 
-Der lokale Smoke-Test simuliert CloudFront, indem er `x-viewer-host` selbst setzt. Erst der
-Deploy-Job zeigt, ob die Kette mit echter OAC funktioniert. Darauf kommt es an:
+Der lokale Smoke-Test simuliert CloudFront, indem er beim POST eine `*.cloudfront.net`-Origin
+schickt, die nicht zum Host passt. Erst der Deploy-Job zeigt, ob die Kette mit echter OAC
+funktioniert. Darauf kommt es an:
 
-- CloudFront leitet `x-viewer-host` und `Origin` über `AllViewerExceptHostHeader` an die Web
-  Function weiter, und Lambda reicht sie unverändert an den Server durch.
+- CloudFront leitet `Origin` über `AllViewerExceptHostHeader` an die Web Function weiter, und
+  Lambda reicht den Header unverändert an den Server durch.
 - POST-Bodies gehen mit `always-amz-auth` ohne `x-amz-content-sha256` durch. Laut AWS-Doku ist
   das bei Web Functions so, anders als bei Function URLs.
 - Die Resource Policy mit `Resource: <EndpointArn>` und `Action: lambda:InvokeWebFunctionEndpoint`
