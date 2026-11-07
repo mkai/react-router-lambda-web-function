@@ -8,13 +8,7 @@ Parameters:
     Description: Git commit SHA; selects the deployment package in the artifacts bucket.
   ArtifactsBucketName:
     Type: String
-    Description: >-
-      Versioned bucket (same Region as the stack) holding versions/<Version>/web.zip.
-      Lambda reads the package from here at runtime, so don't delete old versions
-      that a live revision still references.
-  PackageVersionId:
-    Type: String
-    Description: S3 object version of web.zip; pins the revision to exactly that upload.
+    Description: Bucket (same Region as the stack) holding versions/<Version>/web.zip.
 
 Resources:
   # ---------------------------------------------------------------------------
@@ -43,7 +37,6 @@ Resources:
           S3Object:
             Bucket: !Ref ArtifactsBucketName
             Key: !Sub versions/${Version}/web.zip
-            VersionId: !Ref PackageVersionId
         RuntimeConfig:
           # Node.js 24 on arm64; Web Functions have no architecture setting.
           Runtime: nodejs24.x

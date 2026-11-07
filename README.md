@@ -106,39 +106,22 @@ Der Workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) läuft so:
    hochladen.
 2. **Deploy** (nur `main`, auch manuell per `workflow_dispatch`):
    - `web.zip` nach `s3://react-router-web-function-artifacts-<account-id>/versions/<sha>/`
-     hochladen. Der Bucket wird bei Bedarf angelegt.
-   - Versionierung und eine Bucket Policy für den Lambda-Service setzen (siehe unten). Die
-     S3-Objektversion des Uploads wird als `PackageVersionId` an die Revision übergeben.
-   - Einen Stack im Zustand `ROLLBACK_COMPLETE` (fehlgeschlagener erster Deploy) löschen, weil
-     CloudFormation ihn nicht aktualisieren kann.
+     hochladen. Der Bucket wird bei Bedarf angelegt und muss versioniert sein, weil eine
+     Web-Function-Revision den Code nicht kopiert, sondern direkt aus dem Bucket liest. Pakete,
+     die eine aktive Revision noch nutzt, dürfen daher nicht gelöscht werden.
    - Stack `react-router-web-function` in **eu-west-1** deployen.
    - Smoke-Test gegen die CloudFront-URL: SSR auf arm64, Assets, POST, fremde Origin.
    - Prüfen, dass ein direkter Aufruf des Web-Function-Endpoints **403** liefert.
 
 Die CloudFront-URL steht in der Job-Summary und in den Stack-Outputs (`DistributionUrl`).
 
-### Artifacts-Bucket
-
-Anders als eine klassische Lambda-Funktion kopiert eine Web-Function-Revision den Code nicht. Lambda
-liest das Paket direkt aus dem Bucket (`S3ObjectStorageMode` `REFERENCE`, in der Revision nicht
-einstellbar). Daraus folgt:
-
-- Der Bucket braucht **Versionierung**. Ohne sie bricht `CreateWebFunctionRevision` mit „You must
-  enable S3 versioning for your S3 bucket when S3ObjectStorageMode is set to REFERENCE“ ab.
-- Die Revision ist auf eine bestimmte Objektversion festgelegt (`S3Object.VersionId`).
-- Eine **Bucket Policy** erlaubt `lambda.amazonaws.com` `s3:GetObject` und `s3:GetObjectVersion`
-  auf `versions/*`, eingeschränkt auf dieses Konto und die Web Function dieses Stacks.
-- Pakete, die eine aktive Revision noch referenziert, dürfen nicht gelöscht werden, auch nicht per
-  Lifecycle-Regel.
-
 ### Einrichtung
 
 - Repository-Variable `AWS_ACCESS_KEY_ID` und Secret `AWS_SECRET_ACCESS_KEY`, wie bei Fetchbot.
 - Der IAM-User braucht Rechte für CloudFormation, `lambda:*WebFunction*` sowie
   `lambda:PutResourcePolicy`, `GetResourcePolicy` und `DeleteResourcePolicy`, außerdem
-  `iam:CreateRole`/`PassRole`, CloudFront, CloudWatch Logs und `sts:GetCallerIdentity`. Für S3:
-  `s3:CreateBucket`, `PutBucketVersioning`, `PutBucketPolicy`, `PutObject`, `GetObject` und
-  `GetObjectVersion`.
+  `iam:CreateRole`/`PassRole`, CloudFront, CloudWatch Logs, S3 (inklusive
+  `s3:PutBucketVersioning` und `s3:GetObjectVersion`) und `sts:GetCallerIdentity`.
 
 ### Region
 
