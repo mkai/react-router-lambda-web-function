@@ -79,15 +79,58 @@ jobs:
             aws s3api create-bucket --bucket "$bucket" \
               --create-bucket-configuration LocationConstraint="$AWS_REGION"
           fi
-          aws s3 cp web.zip "s3://$bucket/versions/$GITHUB_SHA/web.zip"
+
+          # Web Function revisions don't copy the package: Lambda reads it from
+          # this bucket (S3ObjectStorageMode REFERENCE), pinned to an object
+          # version. That requires versioning, and a bucket policy that lets
+          # the Lambda service read the objects for this stack's function.
+          aws s3api put-bucket-versioning --bucket "$bucket" \
+            --versioning-configuration Status=Enabled
+          aws s3api put-bucket-policy --bucket "$bucket" --policy "$(cat <<EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "AllowLambdaWebFunctionCodeAccess",
+                "Effect": "Allow",
+                "Principal": { "Service": "lambda.amazonaws.com" },
+                "Action": ["s3:GetObject", "s3:GetObjectVersion"],
+                "Resource": "arn:aws:s3:::${bucket}/versions/*",
+                "Condition": {
+                  "StringEquals": { "aws:SourceAccount": "${account_id}" },
+                  "ArnLike": {
+                    "aws:SourceArn": "arn:aws:lambda:${AWS_REGION}:${account_id}:web-function/${STACK_NAME}-web*"
+                  }
+                }
+              }
+            ]
+          }
+          EOF
+          )"
+
+          version_id="$(aws s3api put-object --bucket "$bucket" \
+            --key "versions/$GITHUB_SHA/web.zip" --body web.zip \
+            --query VersionId --output text)"
+          echo "Uploaded s3://$bucket/versions/$GITHUB_SHA/web.zip (version $version_id)"
           echo "bucket=$bucket" >> "$GITHUB_OUTPUT"
+          echo "version-id=$version_id" >> "$GITHUB_OUTPUT"
+      - name: Remove stack left over from a failed first deploy
+        run: |
+          # A failed stack creation ends in ROLLBACK_COMPLETE, which can't be
+          # updated, only deleted. It holds no resources at that point.
+          status="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].StackStatus' --output text 2>/dev/null || true)"
+          if [ "$status" = "ROLLBACK_COMPLETE" ]; then
+            aws cloudformation delete-stack --stack-name "$STACK_NAME"
+            aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
+          fi
       - name: Deploy CloudFormation stack
         id: stack
         uses: aws-actions/aws-cloudformation-github-deploy@81e3b03d2266bcb76c4bcc37a7d71d9cb67838bb # v2.2.0
         with:
           name: ${{ env.STACK_NAME }}
           template: cloudformation.yaml
-          parameter-overrides: 'Version=${{ github.sha }},ArtifactsBucketName=${{ steps.artifacts.outputs.bucket }}'
+          parameter-overrides: 'Version=${{ github.sha }},ArtifactsBucketName=${{ steps.artifacts.outputs.bucket }},PackageVersionId=${{ steps.artifacts.outputs.version-id }}'
           capabilities: CAPABILITY_IAM
           fail-on-empty-changeset: false
       - name: Smoke test through CloudFront
