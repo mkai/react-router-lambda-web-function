@@ -1,0 +1,116 @@
+name: Build & Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Lambda Web Functions launched in us-east-1, us-east-2, us-west-2,
+  # ap-northeast-1 and eu-west-1 (not eu-central-1).
+  AWS_REGION: eu-west-1
+  STACK_NAME: react-router-web-function
+
+jobs:
+  build:
+    name: Check & build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Lint CloudFormation
+        uses: scottbrenner/cfn-lint-action@8affffc34dddd6937bbc37f60901f71657e20fab # v2.8.0
+        with:
+          command: cfn-lint --regions ${{ env.AWS_REGION }} -- cloudformation.yaml
+      - name: Format check, typecheck, build, local smoke test
+        run: npm run check
+      - name: Package Web Function
+        run: (cd dist && zip -qr "$GITHUB_WORKSPACE/web.zip" .)
+      - name: Upload package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-function
+          path: web.zip
+          retention-days: 7
+
+  deploy:
+    name: Deploy
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AWS_ACCESS_KEY_ID: ${{ vars.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Download package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-function
+      - name: Upload package to S3
+        id: artifacts
+        run: |
+          account_id="$(aws sts get-caller-identity --query Account --output text)"
+          bucket="${STACK_NAME}-artifacts-${account_id}"
+          if ! aws s3api head-bucket --bucket "$bucket" 2>/dev/null; then
+            aws s3api create-bucket --bucket "$bucket" \
+              --create-bucket-configuration LocationConstraint="$AWS_REGION"
+          fi
+          aws s3 cp web.zip "s3://$bucket/versions/$GITHUB_SHA/web.zip"
+          echo "bucket=$bucket" >> "$GITHUB_OUTPUT"
+      - name: Deploy CloudFormation stack
+        id: stack
+        uses: aws-actions/aws-cloudformation-github-deploy@81e3b03d2266bcb76c4bcc37a7d71d9cb67838bb # v2.2.0
+        with:
+          name: ${{ env.STACK_NAME }}
+          template: cloudformation.yaml
+          parameter-overrides: 'Version=${{ github.sha }},ArtifactsBucketName=${{ steps.artifacts.outputs.bucket }}'
+          capabilities: CAPABILITY_IAM
+          fail-on-empty-changeset: false
+      - name: Smoke test through CloudFront
+        env:
+          DISTRIBUTION_URL: ${{ steps.stack.outputs.DistributionUrl }}
+        run: |
+          # A fresh revision or distribution can take a moment to answer.
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if node scripts/smoke.mjs "$DISTRIBUTION_URL"; then
+              exit 0
+            fi
+            echo "Attempt $attempt failed, retrying in 15s"
+            sleep 15
+          done
+          exit 1
+      - name: Direct endpoint access is rejected
+        env:
+          ENDPOINT_URL: ${{ steps.stack.outputs.EndpointUrl }}
+        run: |
+          status="$(curl -s -o /dev/null -w '%{http_code}' "$ENDPOINT_URL/")"
+          echo "GET $ENDPOINT_URL/ -> $status"
+          test "$status" = 403
+      - name: Summary
+        env:
+          DISTRIBUTION_URL: ${{ steps.stack.outputs.DistributionUrl }}
+        run: echo "Deployed to $DISTRIBUTION_URL" >> "$GITHUB_STEP_SUMMARY"
