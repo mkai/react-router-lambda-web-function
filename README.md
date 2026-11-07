@@ -106,9 +106,11 @@ Der Workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) läuft so:
    hochladen.
 2. **Deploy** (nur `main`, auch manuell per `workflow_dispatch`):
    - `web.zip` nach `s3://react-router-web-function-artifacts-<account-id>/versions/<sha>/`
-     hochladen. Der Bucket wird bei Bedarf angelegt und muss versioniert sein, weil eine
-     Web-Function-Revision den Code nicht kopiert, sondern direkt aus dem Bucket liest. Pakete,
-     die eine aktive Revision noch nutzt, dürfen daher nicht gelöscht werden.
+     hochladen. Der Bucket wird bei Bedarf angelegt. Eine Web-Function-Revision kopiert den Code
+     nicht, sondern liest ihn direkt aus dem Bucket. Deshalb ist der Bucket versioniert, und eine
+     Bucket Policy erlaubt dem Lambda-Service (`lambda.amazonaws.com`, nur aus diesem Konto)
+     `s3:GetObject` und `s3:GetObjectVersion` auf `versions/*`. Pakete, die eine aktive Revision
+     noch nutzt, dürfen nicht gelöscht werden.
    - Stack `react-router-web-function` in **eu-west-1** deployen.
    - Smoke-Test gegen die CloudFront-URL: SSR auf arm64, Assets, POST, fremde Origin.
    - Prüfen, dass ein direkter Aufruf des Web-Function-Endpoints **403** liefert.
@@ -121,7 +123,8 @@ Die CloudFront-URL steht in der Job-Summary und in den Stack-Outputs (`Distribut
 - Der IAM-User braucht Rechte für CloudFormation, `lambda:*WebFunction*` sowie
   `lambda:PutResourcePolicy`, `GetResourcePolicy` und `DeleteResourcePolicy`, außerdem
   `iam:CreateRole`/`PassRole`, CloudFront, CloudWatch Logs, S3 (inklusive
-  `s3:PutBucketVersioning` und `s3:GetObjectVersion`) und `sts:GetCallerIdentity`.
+  `s3:PutBucketVersioning`, `s3:PutBucketPolicy` und `s3:GetObjectVersion`) und
+  `sts:GetCallerIdentity`.
 
 ### Region
 

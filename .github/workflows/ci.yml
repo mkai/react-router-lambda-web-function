@@ -80,9 +80,21 @@ jobs:
               --create-bucket-configuration LocationConstraint="$AWS_REGION"
           fi
           # Web Function revisions read the package from this bucket instead of
-          # copying it, which requires S3 versioning.
+          # copying it, which requires S3 versioning and read access for the
+          # Lambda service (limited to this account's functions).
           aws s3api put-bucket-versioning --bucket "$bucket" \
             --versioning-configuration Status=Enabled
+          aws s3api put-bucket-policy --bucket "$bucket" --policy "$(jq -n \
+            --arg resource "arn:aws:s3:::$bucket/versions/*" --arg account "$account_id" '{
+              Version: "2012-10-17",
+              Statement: [{
+                Effect: "Allow",
+                Principal: { Service: "lambda.amazonaws.com" },
+                Action: ["s3:GetObject", "s3:GetObjectVersion"],
+                Resource: $resource,
+                Condition: { StringEquals: { "aws:SourceAccount": $account } }
+              }]
+            }')"
           aws s3 cp web.zip "s3://$bucket/versions/$GITHUB_SHA/web.zip"
           echo "bucket=$bucket" >> "$GITHUB_OUTPUT"
       - name: Deploy CloudFormation stack
