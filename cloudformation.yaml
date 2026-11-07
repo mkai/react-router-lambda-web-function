@@ -151,7 +151,8 @@ Resources:
           TargetOriginId: WebFunction
           ViewerProtocolPolicy: redirect-to-https
           Compress: true
-          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # Managed-CachingDisabled
+          CachePolicyId: !Ref DynamicCachePolicy
+          ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
           # Forwards cookies, query strings and viewer headers (including Origin,
           # which React Router checks on POST against allowedActionOrigins in
           # react-router.config.ts), but keeps Host as the endpoint's domain.
@@ -166,8 +167,45 @@ Resources:
             ViewerProtocolPolicy: redirect-to-https
             Compress: true
             CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
             AllowedMethods: [GET, HEAD]
             CachedMethods: [GET, HEAD]
+
+  # Like Managed-CachingDisabled, but with compression: CloudFront only gzips
+  # or Brotli-compresses responses when the cache policy enables Accept-Encoding
+  # normalization, and that is rejected when every TTL is 0. DefaultTTL 0 means
+  # nothing is cached unless the app sends Cache-Control (it sends no-store);
+  # MaxTTL caps what it can ask for. Cookies and query strings are part of the
+  # key, so a response is never reused across sessions or URLs.
+  DynamicCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub ${AWS::StackName}-dynamic
+        MinTTL: 0
+        DefaultTTL: 0
+        MaxTTL: 1
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          CookiesConfig:
+            CookieBehavior: all
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: all
+
+  # Lambda adds these to every response; they expose the function name,
+  # revision and log stream. The request ID is still in the CloudWatch logs.
+  ResponseHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub ${AWS::StackName}-web
+        RemoveHeadersConfig:
+          Items:
+            - Header: lambda-web-request-id
+            - Header: lambda-web-logstream
 
 Outputs:
   DistributionUrl:
